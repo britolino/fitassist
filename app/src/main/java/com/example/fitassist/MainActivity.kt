@@ -2,6 +2,7 @@ package com.example.fitassist
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
@@ -29,13 +30,13 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.io.File
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 data class LiveSensorState(
     val heartRate: Int? = null,
@@ -75,6 +76,7 @@ fun FitAssistApp(nodeRedUrl: String) {
         var dashboardState by remember { mutableStateOf(DashboardState()) }
         var loading by remember { mutableStateOf(true) }
         var liveState by remember { mutableStateOf(LiveSensorState()) }
+        var coachMessage by remember { mutableStateOf<String?>(null) }
 
         val sensorManager = remember {
             BleSensorManager(
@@ -106,10 +108,51 @@ fun FitAssistApp(nodeRedUrl: String) {
         LaunchedEffect(Unit) {
             while (true) {
                 loading = true
-                dashboardState = fetchDashboardState(nodeRedUrl)
+                val newState = fetchDashboardState(nodeRedUrl)
+                dashboardState = newState
                 loading = false
                 delay(5000)
             }
+        }
+
+        val currentDecision = remember(dashboardState.bodyBattery, liveState.power) {
+            calculateCoachDecision(
+                dashboardState.copy(
+                    power = liveState.power,
+                    heartRate = liveState.heartRate,
+                    cadence = liveState.cadence
+                ),
+                ftp = 250
+            )
+        }
+
+        val hasData = dashboardState.bodyBattery != null || liveState.power != null
+        LaunchedEffect(currentDecision, hasData) {
+            if (!hasData) return@LaunchedEffect
+
+            // Define uma mensagem inicial imediata enquanto a IA processa
+            if (coachMessage == null) {
+                coachMessage = fallbackMessage(currentDecision)
+            }
+
+            Log.i("FitAssist", "IA acionada para: ${currentDecision.action}")
+            val prompt = buildPrompt(currentDecision)
+
+            val output = withContext(Dispatchers.IO) {
+                try {
+                    withTimeoutOrNull(45000) {
+                        runLocalSlm(context, prompt)
+                    }
+                } catch (e: Exception) {
+                    Log.e("FitAssist", "Erro na Coroutine do SLM", e)
+                    null
+                }
+            }
+
+            // Atualiza com o resultado da IA se houver um
+            val processedResult = safeCoachMessage(currentDecision, output)
+            coachMessage = processedResult
+            Log.d("FitAssist", "Resultado final exibido: $processedResult")
         }
 
         DashboardScreen(
@@ -117,6 +160,7 @@ fun FitAssistApp(nodeRedUrl: String) {
                 heartRate = liveState.heartRate ?: dashboardState.heartRate,
                 power = liveState.power ?: dashboardState.power,
                 cadence = liveState.cadence ?: dashboardState.cadence,
+                coachMessage = coachMessage ?: "Aguardando dados...",
                 error = dashboardState.error ?: liveState.error
             ),
             loading = loading,
@@ -161,7 +205,6 @@ suspend fun fetchDashboardState(url: String): DashboardState {
                     heartRate = json.optNullableInt("heart_rate"),
                     power = json.optNullableInt("power"),
                     cadence = json.optNullableInt("cadence"),
-                    coachMessage = json.optStringOrNull("coach_message") ?: generateFallbackCoachMessage(json),
                     error = null
                 )
             }
@@ -174,18 +217,13 @@ suspend fun fetchDashboardState(url: String): DashboardState {
 fun JSONObject.optNullableInt(key: String): Int? = if (has(key) && !isNull(key)) optInt(key) else null
 fun JSONObject.optStringOrNull(key: String): String? = if (has(key) && !isNull(key)) optString(key) else null
 
-fun generateFallbackCoachMessage(json: JSONObject): String {
-    val bb = json.optNullableInt("body_battery") ?: json.optNullableInt("current_body_battery")
-    return if (bb != null && bb < 30) "Body Battery baixo. Priorize recuperação." else "Mantenha o plano de treino."
-}
-
 @Composable
 fun DashboardScreen(state: DashboardState, loading: Boolean, nodeRedUrl: String, bleStatus: String) {
     Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(16.dp)) {
         Column(verticalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxSize()) {
             HeaderCard(loading = loading, bleStatus = bleStatus)
             if (state.error != null) ErrorCard(message = state.error, nodeRedUrl = nodeRedUrl)
-            CoachCard(message = state.coachMessage ?: "Aguardando dados...")
+            CoachCard(message = state.coachMessage ?: "Iniciando Coach...")
             BodyBatteryCard(bodyBattery = state.bodyBattery, charged = state.charged, drained = state.drained, feedback = state.feedbackLevel)
             MetricsRow(heartRate = state.heartRate, power = state.power, cadence = state.cadence)
             LastEventCard(impact = state.lastEventImpact, feedback = state.lastEventFeedback, timestamp = state.timestamp)
@@ -473,4 +511,129 @@ class BleSensorManager(
         if (dt <= 0 || dr <= 0) return null
         return ((dr.toDouble() * 1024.0 * 60.0) / dt.toDouble()).toInt()
     }
+}
+data class CoachDecision(
+    val action: String,
+    val reason: String,
+    val severity: String
+)
+
+fun calculateCoachDecision(state: DashboardState, ftp: Int): CoachDecision {
+    val bb = state.bodyBattery
+    val power = state.power
+
+    return when {
+        bb != null && bb < 30 && power != null && power > ftp ->
+            CoachDecision(
+                action = "Reduzir intensidade",
+                reason = "Body Battery baixo e potência acima do FTP",
+                severity = "alta"
+            )
+
+        bb != null && bb < 30 ->
+            CoachDecision(
+                action = "Reduzir intensidade",
+                reason = "Body Battery baixo",
+                severity = "moderada"
+            )
+
+        power != null && power > ftp ->
+            CoachDecision(
+                action = "Controlar potência",
+                reason = "Potência acima do FTP",
+                severity = "moderada"
+            )
+
+        else ->
+            CoachDecision(
+                action = "Manter plano",
+                reason = "Métricas dentro do esperado",
+                severity = "baixa"
+            )
+    }
+}
+fun buildPrompt(decision: CoachDecision): String {
+    return """
+Task: Rewrite the mandatory coaching decision as one short natural Portuguese sentence.
+
+Rules:
+- Keep the same meaning.
+- Do not add new advice.
+- Output only one sentence.
+
+Mandatory decision:
+Action: ${decision.action}
+Reason: ${decision.reason}
+Severity: ${decision.severity}
+
+Portuguese sentence:
+""".trimIndent()
+}
+
+fun runLocalSlm(context: Context, prompt: String): String {
+    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val mi = ActivityManager.MemoryInfo()
+    am.getMemoryInfo(mi)
+    Log.d("FitAssist", "Memória Livre: ${mi.availMem / 1024 / 1024}MB")
+
+    val exeFile = File("/data/local/tmp/fitassist/llama-cli")
+    if (!exeFile.exists()) return "Erro: llama-cli não encontrado"
+    
+    try { exeFile.setExecutable(true) } catch (e: Exception) {}
+
+    val pb = ProcessBuilder(
+        "/data/local/tmp/fitassist/llama-cli",
+        "-m", "/data/local/tmp/fitassist/model-q4.gguf",
+        "-p", prompt,
+        "-n", "30",
+        "-t", "4",
+        "--no-mmap",
+        "--temp", "0.0"
+    )
+    
+    pb.environment()["LD_LIBRARY_PATH"] = "/data/local/tmp/fitassist"
+    pb.redirectErrorStream(true)
+
+    val process = pb.start()
+    val output = StringBuilder()
+    
+    process.inputStream.bufferedReader().use { reader ->
+        var line: String?
+        while (reader.readLine().also { line = it } != null) {
+            // Log apenas para depuração, não guardamos lixo técnico no output
+            if (!line!!.startsWith("llama_") && !line!!.startsWith("main:") && !line!!.startsWith("system_info")) {
+                output.append(line).append("\n")
+            }
+            Log.d("FitAssist", "IA RAW: $line")
+        }
+    }
+    
+    process.waitFor(35, TimeUnit.SECONDS)
+    return output.toString()
+}
+
+fun fallbackMessage(decision: CoachDecision): String {
+    return when (decision.action) {
+        "Reduzir intensidade" -> "Reduza a intensidade para poupar energia."
+        "Controlar potência" -> "Mantenha a potência controlada."
+        else -> "Mantenha o ritmo planejado."
+    }
+}
+
+fun safeCoachMessage(decision: CoachDecision, slmOutput: String?): String {
+    if (slmOutput.isNullOrBlank()) return fallbackMessage(decision)
+
+    val cleanLines = slmOutput.lines()
+        .map { it.trim() }
+        .filter { it.isNotBlank() && it.length > 10 && !it.contains("Task:") && !it.contains("Mandatory") && !it.contains("Portuguese sentence") }
+
+    // Retornamos a última linha válida (que costuma ser a resposta da IA)
+    val result = cleanLines.lastOrNull() ?: fallbackMessage(decision)
+    
+    val text = result.lowercase()
+    if (decision.action == "Reduzir intensidade" && ("aumente" in text || "aumentar" in text)) {
+        return fallbackMessage(decision)
+    }
+
+    return result
 }
